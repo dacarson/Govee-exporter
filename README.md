@@ -6,7 +6,8 @@
 ## Description
 Listen for BTLE broadcast from Govee H5074 or H5179 devices, and publish the data to Influx DB so that it can be graphed with Grafana. To be run as a service.
 
-Parsing logic for the two different types of Govee devices is based on [https://github.com/Home-Is-Where-You-Hang-Your-Hack/sensor.goveetemp_bt_hci]
+Parsing logic for the two different types of Govee devices is based on [sensor.goveetemp_bt_hci
+](https://github.com/Home-Is-Where-You-Hang-Your-Hack/sensor.goveetemp_bt_hci)
 
 For each device that it hears broadcasting, decodes the device's temperature, humidity, battery and rssi level and logs it at least once per minute.
 
@@ -53,9 +54,11 @@ WantedBy=multi-user.target
 Make sure to specify the User to run as, the path to goveelog.py and the username and password for influxdb.
 
 
-Then run the command to start the service: `systemctl start govee`
-To make the service start automatically on boot, run the command `systemctl enable govee`
-At anytime, check the status of the service with: `systemctl status govee`
+Then run the command to start the service: `systemctl start govee`.
+
+To make the service start automatically on boot, run the command `systemctl enable govee`.
+
+At anytime, check the status of the service with: `systemctl status govee`.
   
   ## License
 
