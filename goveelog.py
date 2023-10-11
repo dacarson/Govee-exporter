@@ -100,34 +100,35 @@ def on_advertisement(advertisement):
 
     mac = advertisement.address.address
     if mac in govee_devices and advertisement.mfg_data is not None:
-        prefix = int(advertisement.mfg_data.hex()[0:4],16)   
- 
-        # H5074 have mfg_data length of 9 
-        if prefix == 0x88EC and len(advertisement.mfg_data) == 9:
-            raw_temp, hum, batt = unpack_from("<HHB", advertisement.mfg_data, 3)
-            govee_devices[mac]["temperature"] = float(twos_complement(raw_temp) / 100.0)
-            govee_devices[mac]["humidity"] = float(hum / 100.0)
-            govee_devices[mac]["battery"] = int(batt)
-            govee_devices[mac]["timestamp"] = time.time()
-
-            if advertisement.rssi is not None and advertisement.rssi != 0:
-                govee_devices[mac]["rssi"] = advertisement.rssi
-
-        # H5179 have mfg_data length of 11 
-        if prefix == 0x0188 and len(advertisement.mfg_data) == 11:
-            raw_temp, hum, batt = unpack_from("<HHB", advertisement.mfg_data, 6)
-            govee_devices[mac]["temperature"] = float(twos_complement(raw_temp) / 100.0)
-            govee_devices[mac]["humidity"] = float(hum / 100.0)
-            govee_devices[mac]["battery"] = int(batt)
-            govee_devices[mac]["timestamp"] = time.time()
-
-            if advertisement.rssi is not None and advertisement.rssi != 0:
-                govee_devices[mac]["rssi"] = advertisement.rssi
-
         time_now = time.time()
-        if time_now - govee_devices[mac]["last_log"] > log_interval and govee_devices[mac]["timestamp"] > 0:
-            process(mac)
-            govee_devices[mac]["last_log"] = time_now 
+        if time_now - govee_devices[mac]["last_log"] > log_interval:
+            prefix = int(advertisement.mfg_data.hex()[0:4],16)   
+ 
+            # H5074 have mfg_data length of 9 
+            if prefix == 0x88EC and len(advertisement.mfg_data) == 9:
+                raw_temp, hum, batt = unpack_from("<HHB", advertisement.mfg_data, 3)
+                govee_devices[mac]["temperature"] = float(twos_complement(raw_temp) / 100.0)
+                govee_devices[mac]["humidity"] = float(hum / 100.0)
+                govee_devices[mac]["battery"] = int(batt)
+                govee_devices[mac]["timestamp"] = time.time()
+
+                if advertisement.rssi is not None and advertisement.rssi != 0:
+                    govee_devices[mac]["rssi"] = advertisement.rssi
+                process(mac)
+                govee_devices[mac]["last_log"] = time_now 
+
+            # H5179 have mfg_data length of 11 
+            if prefix == 0x0188 and len(advertisement.mfg_data) == 11:
+                raw_temp, hum, batt = unpack_from("<HHB", advertisement.mfg_data, 6)
+                govee_devices[mac]["temperature"] = float(twos_complement(raw_temp) / 100.0)
+                govee_devices[mac]["humidity"] = float(hum / 100.0)
+                govee_devices[mac]["battery"] = int(batt)
+                govee_devices[mac]["timestamp"] = time.time()
+
+                if advertisement.rssi is not None and advertisement.rssi != 0:
+                    govee_devices[mac]["rssi"] = advertisement.rssi
+                process(mac)
+                govee_devices[mac]["last_log"] = time_now 
 
     if advertisement.name is not None and advertisement.name.startswith("Govee"):
         if mac not in govee_devices:
@@ -175,3 +176,4 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         terminate()
+
