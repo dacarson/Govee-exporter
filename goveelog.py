@@ -164,9 +164,20 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    adapter = get_provider().get_adapter()
-    observer = Observer(adapter)
-    observer.on_advertising_data = on_advertisement
+    try:
+        adapter = get_provider().get_adapter()
+        observer = Observer(adapter)
+        observer.on_advertising_data = on_advertisement
+    except PermissionError:
+        print("Error: Permission denied accessing Bluetooth adapter.")
+        print("This script requires elevated privileges to access Bluetooth.")
+        print("Please run with sudo or ensure the user has proper Bluetooth permissions.")
+        print("You may also need to run: sudo setcap 'cap_net_raw,cap_net_admin+eip' $(which python3)")
+        exit(1)
+    except Exception as e:
+        print(f"Error initializing Bluetooth adapter: {e}")
+        print("Please ensure Bluetooth is enabled and accessible.")
+        exit(1)
 
     try:
         while True:
@@ -175,5 +186,8 @@ if __name__ == "__main__":
             observer.stop()
 
     except KeyboardInterrupt:
-        terminate()
+        print("\nShutting down gracefully...")
+        if 'observer' in locals():
+            observer.stop()
+        exit(0)
 
