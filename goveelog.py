@@ -1,12 +1,11 @@
 #!/usr/bin/python3
 
 import argparse
+import asyncio
 import time
-from bleson import get_provider, Observer
-from bleson.logger import log, set_level, ERROR, DEBUG
-import json
 from pprint import pprint
 from struct import unpack_from
+from bleak import BleakScanner
 
 """
 usage: goveelog.py [-h] [-r] [-v]
@@ -27,12 +26,6 @@ optional arguments:
                         InfluxDb database name
   -v, --verbose         verbose output to watch the threads
 """
-
-# Disable warnings
-set_level(ERROR)
-
-# # Uncomment for debug log level
-# set_level(DEBUG)
 
 govee_devices = {}
 log_interval = 59
@@ -92,55 +85,94 @@ def process(mac):
     if args.influxdb:
         influxdb_publish(govee_device['name'], govee_device) 
 
-# Govee parsing is based on: https://github.com/Home-Is-Where-You-Hang-Your-Hack/sensor.goveetemp_bt_hci
+def parse_govee_data(mac, manufacturer_data, rssi):
+    data = bytes(manufacturer_data)
+    length = len(data)
 
-# On BLE advertisement callback
-def on_advertisement(advertisement):
-    log.debug(advertisement)
+    # ------------------------------
+    # H5074 (new 7-byte format)
+    # ------------------------------
+    if length == 7:
+        temp_raw = int.from_bytes(data[1:3], "little")
+        hum_raw  = int.from_bytes(data[3:5], "little")
+        batt     = data[5]
+        temperature = temp_raw / 100.0
+        humidity = hum_raw / 100.0
 
-    mac = advertisement.address.address
-    if mac in govee_devices and advertisement.mfg_data is not None:
-        time_now = time.time()
-        if time_now - govee_devices[mac]["last_log"] > log_interval:
-            prefix = int(advertisement.mfg_data.hex()[0:4],16)   
- 
-            # H5074 have mfg_data length of 9 
-            if prefix == 0x88EC and len(advertisement.mfg_data) == 9:
-                raw_temp, hum, batt = unpack_from("<HHB", advertisement.mfg_data, 3)
-                govee_devices[mac]["temperature"] = float(twos_complement(raw_temp) / 100.0)
-                govee_devices[mac]["humidity"] = float(hum / 100.0)
-                govee_devices[mac]["battery"] = int(batt)
-                govee_devices[mac]["timestamp"] = time.time()
+    # ------------------------------
+    # H5074 (legacy 9-byte format)
+    # ------------------------------
+    elif length == 9 and data[0:2] == b'\xEC\x88':
+        raw_temp, hum, batt = unpack_from("<HHB", data, 3)
+        temperature = twos_complement(raw_temp) / 100.0
+        humidity = hum / 100.0
 
-                if advertisement.rssi is not None and advertisement.rssi != 0:
-                    govee_devices[mac]["rssi"] = advertisement.rssi
-                process(mac)
-                govee_devices[mac]["last_log"] = time_now 
+    # ------------------------------
+    # H5179 (11-byte format)
+    # ------------------------------
+    elif length == 11 and data[0:2] == b'\x88\x01':
+        raw_temp, hum, batt = unpack_from("<HHB", data, 6)
+        temperature = twos_complement(raw_temp) / 100.0
+        humidity = hum / 100.0
 
-            # H5179 have mfg_data length of 11 
-            if prefix == 0x0188 and len(advertisement.mfg_data) == 11:
-                raw_temp, hum, batt = unpack_from("<HHB", advertisement.mfg_data, 6)
-                govee_devices[mac]["temperature"] = float(twos_complement(raw_temp) / 100.0)
-                govee_devices[mac]["humidity"] = float(hum / 100.0)
-                govee_devices[mac]["battery"] = int(batt)
-                govee_devices[mac]["timestamp"] = time.time()
+    else:
+        return
 
-                if advertisement.rssi is not None and advertisement.rssi != 0:
-                    govee_devices[mac]["rssi"] = advertisement.rssi
-                process(mac)
-                govee_devices[mac]["last_log"] = time_now 
+    now = time.time()
 
-    if advertisement.name is not None and advertisement.name.startswith("Govee"):
-        if mac not in govee_devices:
-            govee_devices[mac] = {}
-            name = advertisement.name.split("'")[0]
-            govee_devices[mac]["address"] = mac
-            govee_devices[mac]["name"] = name
-            govee_devices[mac]["last_log"] = 0
-            govee_devices[mac]["timestamp"] = 0
-            if args.verbose:
-                print("Found " + name)
-    
+    # ensure dict exists, then update values
+    if mac not in govee_devices:
+        govee_devices[mac] = {}
+
+    govee_devices[mac].update({
+        "temperature": temperature,
+        "humidity": humidity,
+        "battery": batt,
+        "rssi": rssi,
+        "timestamp": now,
+        "last_log": now,
+    })
+
+    process(mac)
+
+def detection_callback(device, advertisement_data):
+    mac = device.address
+    name = (device.name or "").strip()
+    rssi = advertisement_data.rssi
+
+    # Process only devices whose name starts with "Govee"
+    if not name.startswith("Govee"):
+        return
+
+    # Ensure we have a device record
+    if mac not in govee_devices:
+        govee_devices[mac] = {
+            "address": mac,
+            "name": name,
+            "last_log": 0,
+            "timestamp": 0,
+        }
+        if args.verbose:
+            print(f"Found {name} ({mac})")
+
+    # Ignore any packets without manufacturer data
+    if not advertisement_data.manufacturer_data:
+        return
+
+    # Process only known Govee manufacturer IDs (0x88EC, 0x0188)
+    for mfg_id, data in advertisement_data.manufacturer_data.items():
+        if mfg_id in (0xEC88, 0x88EC, 0x0188):
+            parse_govee_data(mac, data, rssi)
+            
+async def main():
+    print("Starting BLE scan (Ctrl+C to stop)…")
+    async with BleakScanner(detection_callback) as scanner:
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            print("\nStopping scan…")
+
 # ###########################################################################
 if __name__ == "__main__":
 
@@ -164,30 +196,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    try:
-        adapter = get_provider().get_adapter()
-        observer = Observer(adapter)
-        observer.on_advertising_data = on_advertisement
-    except PermissionError:
-        print("Error: Permission denied accessing Bluetooth adapter.")
-        print("This script requires elevated privileges to access Bluetooth.")
-        print("Please run with sudo or ensure the user has proper Bluetooth permissions.")
-        print("You may also need to run: sudo setcap 'cap_net_raw,cap_net_admin+eip' $(which python3)")
-        exit(1)
-    except Exception as e:
-        print(f"Error initializing Bluetooth adapter: {e}")
-        print("Please ensure Bluetooth is enabled and accessible.")
-        exit(1)
-
-    try:
-        while True:
-            observer.start()
-            time.sleep(0.5)
-            observer.stop()
-
-    except KeyboardInterrupt:
-        print("\nShutting down gracefully...")
-        if 'observer' in locals():
-            observer.stop()
-        exit(0)
-
+    asyncio.run(main())

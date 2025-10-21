@@ -8,19 +8,24 @@ Listen for BTLE broadcast from Govee H5074 or H5179 devices, and publish the dat
 
 ## System Requirements
 - **Bluetooth adapter**: Must be enabled and accessible
-- **Permissions**: Requires elevated privileges to access Bluetooth HCI interface
 - **Python 3**: Tested with Python 3.11+
-- **Dependencies**: bleson, influxdb-client
+- **Dependencies**: bleak, influxdb-client
 
 ## Setup & Permissions
-Due to Bluetooth security restrictions, this script requires elevated permissions. Choose one of these approaches:
+The script uses the `bleak` library for Bluetooth Low Energy scanning, which typically requires fewer special permissions than raw HCI access. However, you may still need elevated permissions depending on your system configuration.
 
-### Option 1: Run with sudo (simplest)
+### Option 1: Run with sudo (if needed)
 ```bash
 sudo python3 goveelog.py [options]
 ```
 
-### Option 2: Set capabilities (recommended for services)
+### Option 2: Add user to bluetooth group
+```bash
+sudo usermod -a -G bluetooth $USER
+# Log out and back in
+```
+
+### Option 3: Set capabilities (if still needed)
 ```bash
 # Find your Python executable
 readlink -f $(which python3)
@@ -29,13 +34,7 @@ readlink -f $(which python3)
 sudo setcap 'cap_net_raw,cap_net_admin+eip' /usr/bin/python3.11
 ```
 
-### Option 3: Add user to bluetooth group + capabilities
-```bash
-sudo usermod -a -G bluetooth $USER
-# Log out and back in, then set capabilities as above
-```
-
-**Note**: If you get "Permission denied" errors, the script will now provide clear error messages explaining the issue.
+**Note**: The `bleak` library should work with standard user permissions on most systems. Try running without sudo first.
 
 Parsing logic for the two different types of Govee devices is based on [sensor.goveetemp_bt_hci
 ](https://github.com/Home-Is-Where-You-Hang-Your-Hack/sensor.goveetemp_bt_hci)
@@ -50,7 +49,7 @@ usage: goveelog.py [-h] [-r] [--influxdb] [--influxdb_host INFLUXDB_HOST] [--inf
 
 optional arguments:
   -h, --help            show this help message and exit
-  -r, --raw             print json data to stddout
+  -r, --raw             print raw data to stdout
   --influxdb            publish to influxdb
   --influxdb_host INFLUXDB_HOST
                         hostname of InfluxDB HTTP API (default: localhost)
@@ -62,7 +61,7 @@ optional arguments:
                         InfluxDB password
   --influxdb_db INFLUXDB_DB
                         InfluxDB database name (default: govee)
-  -v, --verbose         verbose mode - show threads
+  -v, --verbose         verbose mode - show device discovery and data
   ````
 
 To configure a service, create the file `/etc/systemd/system/govee.service` and insert the following information:
@@ -96,8 +95,8 @@ At anytime, check the status of the service with: `systemctl status govee`.
 ### Common Issues
 
 **Permission denied accessing Bluetooth adapter**
-- The script requires elevated privileges to access Bluetooth
-- Use one of the permission setup options above
+- The script uses the `bleak` library which typically requires fewer permissions
+- Try running without sudo first, then use the permission setup options if needed
 - Check that Bluetooth is enabled: `bluetoothctl show`
 
 **Service fails to start**
@@ -108,7 +107,8 @@ At anytime, check the status of the service with: `systemctl status govee`.
 **No data being collected**
 - Verify Bluetooth is working: `bluetoothctl scan on`
 - Check that Govee devices are broadcasting (batteries not dead)
-- Use `-v` flag for verbose output to debug
+- Use `-v` flag for verbose output to see device discovery and data
+- The script now uses async BLE scanning which may be more reliable
 
 **InfluxDB connection issues**
 - Verify InfluxDB is running and accessible
