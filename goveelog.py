@@ -12,11 +12,20 @@ from pathlib import Path
 from pprint import pprint
 from struct import unpack_from
 from bleak import BleakScanner
-try:
-    import bleak as _bleak
-    BLEAK_VERSION = getattr(_bleak, "__version__", "unknown")
-except Exception:
-    BLEAK_VERSION = "unknown"
+
+def _bleak_version():
+    try:
+        from importlib.metadata import version
+        return version("bleak")
+    except Exception:
+        pass
+    try:
+        import bleak as _bleak
+        return getattr(_bleak, "__version__", "unknown")
+    except Exception:
+        return "unknown"
+
+BLEAK_VERSION = _bleak_version()
 
 """
 usage: goveelog.py [-h] [-r] [-v]
@@ -332,6 +341,81 @@ def restart_bluetooth_service():
     print("[WATCHDOG] Failed to restart bluetooth.service (permission denied or command failed)")
     return False
 
+def stop_bluetooth_discovery():
+    """Ask BlueZ to release a stuck discovery session."""
+    commands = [
+        ["bluetoothctl", "--timeout", "5", "scan", "off"],
+        ["bluetoothctl", "scan", "off"],
+    ]
+    for cmd in commands:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                print(f"[WATCHDOG] Stopped BlueZ discovery using: {' '.join(cmd)}")
+                return True
+            if args.verbose:
+                stderr = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+                print(f"[WATCHDOG DEBUG] {' '.join(cmd)} failed: {stderr}")
+        except Exception as e:
+            if args.verbose:
+                print(f"[WATCHDOG DEBUG] Exception while running {' '.join(cmd)}: {e}")
+    print("[WATCHDOG] Could not stop BlueZ discovery (session may be held by another process)")
+    return False
+
+def log_bluetooth_status():
+    """Print adapter and competing-scanner state to diagnose empty scans."""
+    print("[BT DEBUG] --- Bluetooth adapter status ---")
+    print(f"[BT DEBUG] This process PID: {os.getpid()}")
+    print(f"[BT DEBUG] Lockfile in use: {LOCKFILE}")
+    for path in (Path("/var/run/goveelog.pid"), Path.home() / ".goveelog.pid"):
+        if path.exists():
+            try:
+                print(f"[BT DEBUG] Lockfile {path} exists, PID={path.read_text().strip()}")
+            except Exception as e:
+                print(f"[BT DEBUG] Lockfile {path} exists but unreadable: {e}")
+        else:
+            print(f"[BT DEBUG] Lockfile {path} does not exist")
+
+    try:
+        result = subprocess.run(
+            ["pgrep", "-af", "goveelog.py|bluetoothctl|hcitool|lescan"],
+            capture_output=True, text=True, timeout=5
+        )
+        procs = [line for line in result.stdout.splitlines() if line.strip()]
+        print("[BT DEBUG] Related processes:")
+        for line in procs or ["(none)"]:
+            print(f"  {line}")
+    except Exception as e:
+        print(f"[BT DEBUG] Could not list goveelog processes: {e}")
+
+    for unit in ("bluetooth.service", "govee-exporter.service"):
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", unit],
+                capture_output=True, text=True, timeout=5
+            )
+            print(f"[BT DEBUG] {unit}: {result.stdout.strip() or result.stderr.strip() or 'unknown'}")
+        except Exception as e:
+            print(f"[BT DEBUG] Could not check {unit}: {e}")
+
+    try:
+        result = subprocess.run(
+            ["bluetoothctl", "show"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+            print(f"[BT DEBUG] bluetoothctl show failed: {err}")
+        else:
+            keys = ("Powered", "Discovering", "Discoverable", "Name", "Alias")
+            for line in result.stdout.splitlines():
+                stripped = line.strip()
+                if any(stripped.startswith(k) for k in keys):
+                    print(f"[BT DEBUG] {stripped}")
+    except Exception as e:
+        print(f"[BT DEBUG] bluetoothctl show exception: {e}")
+    print("[BT DEBUG] --- end adapter status ---")
+
 def is_govee_name(name):
     """Govee H5074 uses Govee_*, H5075/H517x often use GVH*."""
     return name.startswith("Govee") or name.startswith("GVH")
@@ -473,6 +557,7 @@ async def main():
     
     if args.verbose:
         print(f"[MAIN DEBUG] Lock acquired successfully, continuing...")
+        log_bluetooth_status()
     
     try:
         print("Starting BLE scan (Ctrl+C to stop)…")
@@ -493,6 +578,8 @@ async def main():
             max_retries = 3
             retry_delay = 3  # seconds
             attempt = 1
+            bt_restart_attempts = 0
+            max_bt_restarts = 3
             
             while attempt <= max_retries:
                 if args.verbose:
@@ -502,25 +589,14 @@ async def main():
                     # Give BlueZ a moment to clear any previous discovery state
                     await asyncio.sleep(0.5)
 
-                scanner_kwargs = {}
-                if platform.system() == "Linux":
-                    # DuplicateData=True lets changing Govee manufacturer payloads through.
-                    scanner_kwargs["bluez"] = {"filters": {"Transport": "le", "DuplicateData": True}}
-
-                try:
-                    scanner = BleakScanner(
-                        detection_callback,
-                        scanning_mode=scanning_mode,
-                        **scanner_kwargs
-                    )
-                except TypeError:
-                    scanner = BleakScanner(
-                        detection_callback,
-                        scanning_mode=scanning_mode
-                    )
+                scanner = BleakScanner(
+                    detection_callback,
+                    scanning_mode=scanning_mode
+                )
                 
                 try:
                     restart_requested = False
+                    restart_bluetooth_needed = False
                     async with scanner:
                         try:
                             # Periodically check discovered devices to ensure we're tracking all Govee devices.
@@ -551,15 +627,12 @@ async def main():
                                         if no_ads:
                                             print(f"[WATCHDOG] No BLE advertisements at all for {time_since_scan_start:.1f}s")
                                             print("[WATCHDOG] Bluetooth adapter is likely stuck (BlueZ discovery not delivering packets)")
+                                            restart_bluetooth_needed = True
                                         else:
                                             print(f"[WATCHDOG] No valid Govee packets for {time_since_last_packet:.1f}s (threshold: {args.watchdog_timeout}s)")
-                                        if args.watchdog_restart_bluetooth:
-                                            print("[WATCHDOG] Restarting bluetooth.service...")
-                                            restart_bluetooth_service()
-                                            await asyncio.sleep(3)
-                                        else:
-                                            await asyncio.sleep(1)
-                                        print("[WATCHDOG] Restarting BLE scanner...")
+                                            if args.watchdog_restart_bluetooth:
+                                                restart_bluetooth_needed = True
+                                        print("[WATCHDOG] Stopping current BLE scanner...")
                                         restart_requested = True
                                         break
                                 
@@ -614,9 +687,23 @@ async def main():
                         except KeyboardInterrupt:
                             print("\nStopping scan…")
                     if restart_requested:
-                        # Reset retry counter for watchdog recoveries.
+                        print("[WATCHDOG] Releasing discovery session...")
+                        stop_bluetooth_discovery()
+                        await asyncio.sleep(2)
+                        if restart_bluetooth_needed:
+                            if bt_restart_attempts >= max_bt_restarts:
+                                print("[WATCHDOG] Bluetooth restart limit reached; giving up")
+                                print("[WATCHDOG] Run: sudo systemctl stop govee-exporter.service; sudo systemctl restart bluetooth.service")
+                                sys.exit(1)
+                            bt_restart_attempts += 1
+                            print("[WATCHDOG] Restarting bluetooth.service...")
+                            if not restart_bluetooth_service():
+                                print("[WATCHDOG] Could not restart bluetooth.service; scanner restart alone usually fails when discovery is stuck.")
+                                print("[WATCHDOG] Run: sudo systemctl restart bluetooth.service")
+                            await asyncio.sleep(3)
                         last_packet_timestamp = 0
                         attempt = 1
+                        print("[WATCHDOG] Restarting BLE scanner...")
                         continue
                     # Successful scan started; break out of retry loop
                     break
@@ -625,9 +712,20 @@ async def main():
                     if "org.bluez.Error.InProgress" in error_text:
                         print("WARNING: Bluetooth adapter reports that a scan is already in progress.")
                         print("         Another process may be using the adapter or a previous scan is still stopping.")
+                        if args.verbose:
+                            log_bluetooth_status()
+                        stop_bluetooth_discovery()
                         if attempt == max_retries:
-                            print("ERROR: Max retries reached while trying to start BLE scan.")
-                            raise
+                            if bt_restart_attempts >= max_bt_restarts:
+                                print("ERROR: Max retries reached while trying to start BLE scan.")
+                                raise
+                            bt_restart_attempts += 1
+                            print("[WATCHDOG] Scan still InProgress after retries; restarting bluetooth.service...")
+                            restart_bluetooth_service()
+                            await asyncio.sleep(3)
+                            last_packet_timestamp = 0
+                            attempt = 1
+                            continue
                         attempt += 1
                         if args.verbose:
                             print(f"[SCAN DEBUG] Waiting {retry_delay}s before retrying scan start…")
