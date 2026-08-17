@@ -81,6 +81,7 @@ def get_lockfile_path():
         return home_path
 
 LOCKFILE = get_lockfile_path()
+KNOWN_LOCKFILES = (Path("/var/run/goveelog.pid"), Path.home() / ".goveelog.pid")
 
 # ###########################################################################
 
@@ -156,10 +157,40 @@ class InstanceLock:
                     pass
             self._debug("Returning False due to exception")
             return False
+
+    def _check_other_lockfiles(self):
+        """Refuse to start if another lock path has a live instance; clean stale ones with --force."""
+        for path in KNOWN_LOCKFILES:
+            if path == self.lockfile_path or not path.exists():
+                continue
+            try:
+                pid = path.read_text().strip()
+            except Exception as e:
+                self._debug(f"Could not read {path}: {e}")
+                continue
+            if pid and self._is_pid_running(pid):
+                print(f"ERROR: Another instance is already running (PID: {pid})")
+                print(f"      Lockfile: {path}")
+                print(f"      Stop that process before starting another scanner.")
+                return False
+            self._debug(f"Stale lockfile at {path} (PID {pid})")
+            if self.force:
+                try:
+                    path.unlink()
+                    print(f"Removing stale lockfile {path} (PID {pid} not running)")
+                except OSError as e:
+                    print(f"WARNING: Could not remove stale lockfile {path}: {e}")
+                    print(f"         Run: sudo rm {path}")
+            else:
+                print(f"WARNING: Stale lockfile {path} (PID {pid} not running)")
+                print(f"         Use --force or: sudo rm {path}")
+        return True
         
     def acquire(self):
         """Acquire the lockfile. Returns True if successful, False if already locked."""
         self._debug(f"Attempting to acquire lock (force={self.force})")
+        if not self._check_other_lockfiles():
+            return False
         # First check for stale lockfiles
         stale_check_result = self._check_and_clean_stale_lock()
         self._debug(f"Stale check result: {stale_check_result}")
@@ -416,6 +447,20 @@ def log_bluetooth_status():
         print(f"[BT DEBUG] bluetoothctl show exception: {e}")
     print("[BT DEBUG] --- end adapter status ---")
 
+def bluetooth_is_discovering():
+    """Return True if BlueZ reports the adapter is already in a discovery session."""
+    try:
+        result = subprocess.run(
+            ["bluetoothctl", "show"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            if line.strip().startswith("Discovering:"):
+                return line.strip().lower().endswith("yes")
+    except Exception:
+        pass
+    return False
+
 def is_govee_name(name):
     """Govee H5074 uses Govee_*, H5075/H517x often use GVH*."""
     return name.startswith("Govee") or name.startswith("GVH")
@@ -587,6 +632,9 @@ async def main():
                 
                 if platform.system() == "Linux":
                     # Give BlueZ a moment to clear any previous discovery state
+                    if bluetooth_is_discovering():
+                        print("[SCAN DEBUG] Adapter already Discovering; stopping leftover discovery session...")
+                        stop_bluetooth_discovery()
                     await asyncio.sleep(0.5)
 
                 scanner = BleakScanner(
