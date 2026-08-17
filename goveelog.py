@@ -12,6 +12,11 @@ from pathlib import Path
 from pprint import pprint
 from struct import unpack_from
 from bleak import BleakScanner
+try:
+    import bleak as _bleak
+    BLEAK_VERSION = getattr(_bleak, "__version__", "unknown")
+except Exception:
+    BLEAK_VERSION = "unknown"
 
 """
 usage: goveelog.py [-h] [-r] [-v]
@@ -36,6 +41,7 @@ optional arguments:
 govee_devices = {}
 log_interval = 59
 last_packet_timestamp = 0
+GOVEE_MFG_IDS = (0xEC88, 0x88EC, 0x0188)
 
 import subprocess
 import time
@@ -326,6 +332,15 @@ def restart_bluetooth_service():
     print("[WATCHDOG] Failed to restart bluetooth.service (permission denied or command failed)")
     return False
 
+def is_govee_name(name):
+    """Govee H5074 uses Govee_*, H5075/H517x often use GVH*."""
+    return name.startswith("Govee") or name.startswith("GVH")
+
+def reset_scan_counters():
+    """Reset per-scan advertisement counters used by diagnostics and watchdog."""
+    detection_callback._all_count = 0
+    detection_callback._non_govee_count = 0
+
 def process(mac):
     govee_device = govee_devices[mac]
     if args.raw or args.verbose:
@@ -389,50 +404,55 @@ def detection_callback(device, advertisement_data):
     mac = device.address
     name = (device.name or "").strip()
     rssi = advertisement_data.rssi
+    mfg = advertisement_data.manufacturer_data or {}
+    has_govee_mfg = any(mfg_id in GOVEE_MFG_IDS for mfg_id in mfg)
 
-    # Process only devices whose name starts with "Govee"
-    if not name.startswith("Govee"):
+    detection_callback._all_count = getattr(detection_callback, "_all_count", 0) + 1
+    if args.verbose and detection_callback._all_count <= 5:
+        mfg_ids = ", ".join(f"0x{mfg_id:04X}" for mfg_id in mfg) or "none"
+        print(f"[CALLBACK DEBUG] Advertisement #{detection_callback._all_count}: name={name or '(no name)'} mac={mac} rssi={rssi} mfg={mfg_ids}")
+
+    # Accept Govee by name or manufacturer ID (H5074 often splits name and data across ads)
+    if not is_govee_name(name) and not has_govee_mfg:
         if args.verbose:
-            # Log non-Govee devices occasionally for debugging
-            if hasattr(detection_callback, '_non_govee_count'):
-                detection_callback._non_govee_count += 1
-            else:
-                detection_callback._non_govee_count = 1
+            detection_callback._non_govee_count = getattr(detection_callback, "_non_govee_count", 0) + 1
             if detection_callback._non_govee_count % 100 == 0:
-                print(f"[CALLBACK DEBUG] Ignored {detection_callback._non_govee_count} non-Govee devices")
+                print(f"[CALLBACK DEBUG] Ignored {detection_callback._non_govee_count} non-Govee devices ({detection_callback._all_count} total advertisements)")
         return
 
     # Track callback calls per device for debugging
     if args.verbose:
-        if not hasattr(detection_callback, '_device_counts'):
+        if not hasattr(detection_callback, "_device_counts"):
             detection_callback._device_counts = {}
         detection_callback._device_counts[mac] = detection_callback._device_counts.get(mac, 0) + 1
         if detection_callback._device_counts[mac] % 10 == 0:
-            print(f"[CALLBACK DEBUG] Received {detection_callback._device_counts[mac]} callbacks from {name} ({mac})")
+            print(f"[CALLBACK DEBUG] Received {detection_callback._device_counts[mac]} callbacks from {name or '(no name)'} ({mac})")
 
     # Ensure we have a device record
     if mac not in govee_devices:
         govee_devices[mac] = {
             "address": mac,
-            "name": name,
+            "name": name or mac,
             "last_log": 0,
             "timestamp": 0,
         }
         if args.verbose:
-            print(f"Found {name} ({mac})")
+            print(f"Found {name or '(no name)'} ({mac})")
+    elif name and govee_devices[mac].get("name") in ("", mac):
+        govee_devices[mac]["name"] = name
 
     # Ignore any packets without manufacturer data
-    if not advertisement_data.manufacturer_data:
+    if not mfg:
         if args.verbose:
-            print(f"[CALLBACK DEBUG] {name} ({mac}) advertisement has no manufacturer data")
+            print(f"[CALLBACK DEBUG] {name or '(no name)'} ({mac}) advertisement has no manufacturer data")
         return
 
     # Process only known Govee manufacturer IDs (0x88EC, 0x0188)
-    for mfg_id, data in advertisement_data.manufacturer_data.items():
-        if mfg_id in (0xEC88, 0x88EC, 0x0188):
+    for mfg_id, data in mfg.items():
+        if mfg_id in GOVEE_MFG_IDS:
             parse_govee_data(mac, data, rssi)
         elif args.verbose:
-            print(f"[CALLBACK DEBUG] {name} ({mac}) has unknown manufacturer ID: 0x{mfg_id:04X}")
+            print(f"[CALLBACK DEBUG] {name or '(no name)'} ({mac}) has unknown manufacturer ID: 0x{mfg_id:04X}")
             
 async def main():
     global last_packet_timestamp
@@ -480,12 +500,24 @@ async def main():
                 
                 if platform.system() == "Linux":
                     # Give BlueZ a moment to clear any previous discovery state
-                    time.sleep(0.5)
+                    await asyncio.sleep(0.5)
 
-                scanner = BleakScanner(
-                    detection_callback,
-                    scanning_mode=scanning_mode
-                )
+                scanner_kwargs = {}
+                if platform.system() == "Linux":
+                    # DuplicateData=True lets changing Govee manufacturer payloads through.
+                    scanner_kwargs["bluez"] = {"filters": {"Transport": "le", "DuplicateData": True}}
+
+                try:
+                    scanner = BleakScanner(
+                        detection_callback,
+                        scanning_mode=scanning_mode,
+                        **scanner_kwargs
+                    )
+                except TypeError:
+                    scanner = BleakScanner(
+                        detection_callback,
+                        scanning_mode=scanning_mode
+                    )
                 
                 try:
                     restart_requested = False
@@ -496,21 +528,31 @@ async def main():
                             # from one device might stop being reported after a while.
                             last_check = time.time()
                             last_stats = time.time()
+                            scan_started_at = last_stats
                             check_interval = 5  # Check every 5 seconds on Linux for more frequent updates
                             stats_interval = 30  # Print statistics every 30 seconds
-                            if last_packet_timestamp == 0:
-                                last_packet_timestamp = last_stats
+                            no_ads_timeout = 60  # Adapter is stuck if we see zero BLE ads this long
+                            last_packet_timestamp = scan_started_at
+                            reset_scan_counters()
                             
                             while True:
                                 await asyncio.sleep(1)
                                 current_time = time.time()
+                                ads_received = getattr(detection_callback, "_all_count", 0)
 
                                 # Watchdog: if we stop receiving packets, restart scanner
                                 # and optionally restart bluetooth.service.
                                 if args.watchdog_timeout > 0:
                                     time_since_last_packet = current_time - last_packet_timestamp
-                                    if time_since_last_packet >= args.watchdog_timeout:
-                                        print(f"[WATCHDOG] No valid Govee packets for {time_since_last_packet:.1f}s (threshold: {args.watchdog_timeout}s)")
+                                    time_since_scan_start = current_time - scan_started_at
+                                    no_ads = ads_received == 0 and time_since_scan_start >= min(no_ads_timeout, args.watchdog_timeout)
+                                    no_govee = time_since_last_packet >= args.watchdog_timeout
+                                    if no_ads or no_govee:
+                                        if no_ads:
+                                            print(f"[WATCHDOG] No BLE advertisements at all for {time_since_scan_start:.1f}s")
+                                            print("[WATCHDOG] Bluetooth adapter is likely stuck (BlueZ discovery not delivering packets)")
+                                        else:
+                                            print(f"[WATCHDOG] No valid Govee packets for {time_since_last_packet:.1f}s (threshold: {args.watchdog_timeout}s)")
                                         if args.watchdog_restart_bluetooth:
                                             print("[WATCHDOG] Restarting bluetooth.service...")
                                             restart_bluetooth_service()
@@ -525,6 +567,8 @@ async def main():
                                 if args.verbose and current_time - last_stats >= stats_interval:
                                     last_stats = current_time
                                     print(f"\n[STATS] Device detection statistics:")
+                                    print(f"  Total BLE advertisements this scan: {ads_received}")
+                                    print(f"  Non-Govee advertisements ignored: {getattr(detection_callback, '_non_govee_count', 0)}")
                                     if hasattr(detection_callback, '_device_counts'):
                                         for mac, count in detection_callback._device_counts.items():
                                             device_name = govee_devices.get(mac, {}).get('name', 'Unknown')
@@ -532,6 +576,9 @@ async def main():
                                             time_since = current_time - last_seen if last_seen > 0 else float('inf')
                                             print(f"  {device_name} ({mac}): {count} callbacks, last data {time_since:.1f}s ago")
                                     print(f"  Total Govee devices tracked: {len(govee_devices)}")
+                                    if ads_received == 0:
+                                        print("  HINT: 0 advertisements usually means BlueZ scanning is stuck.")
+                                        print("        Run: sudo systemctl restart bluetooth.service")
                                     print()
                                 
                                 # Periodically verify we're still seeing all Govee devices
@@ -539,11 +586,11 @@ async def main():
                                     last_check = current_time
                                     discovered = scanner.discovered_devices
                                     if args.verbose:
-                                        print(f"[SCAN DEBUG] Checking discovered devices ({len(discovered)} total)...")
+                                        print(f"[SCAN DEBUG] Checking discovered devices ({len(discovered)} total, {ads_received} advertisements)...")
                                     
                                     for device in discovered:
                                         # Ensure all Govee devices are tracked (even if callback missed recent advertisements)
-                                        if device.name and device.name.startswith("Govee"):
+                                        if device.name and is_govee_name(device.name.strip()):
                                             if device.address not in govee_devices:
                                                 if args.verbose:
                                                     print(f"Fallback: Found {device.name} ({device.address}) in discovered list")
@@ -562,12 +609,13 @@ async def main():
                                                 if time_since_last > 30:  # Warn if we haven't seen data in 30 seconds
                                                     print(f"Warning: {device.name} ({device.address}) in discovered list but no recent data (last: {time_since_last:.1f}s ago)")
                                     if args.verbose:
-                                        govee_in_discovered = [d for d in discovered if d.name and d.name.startswith("Govee")]
+                                        govee_in_discovered = [d for d in discovered if d.name and is_govee_name(d.name.strip())]
                                         print(f"[SCAN DEBUG] Found {len(govee_in_discovered)} Govee devices in discovered list")
                         except KeyboardInterrupt:
                             print("\nStopping scan…")
                     if restart_requested:
                         # Reset retry counter for watchdog recoveries.
+                        last_packet_timestamp = 0
                         attempt = 1
                         continue
                     # Successful scan started; break out of retry loop
@@ -602,6 +650,7 @@ async def main():
 if __name__ == "__main__":
     print("[SCRIPT START] Script execution started")
     print(f"[SCRIPT START] Python version: {sys.version}")
+    print(f"[SCRIPT START] Bleak version: {BLEAK_VERSION}")
     print(f"[SCRIPT START] PID: {os.getpid()}")
     
     # argument parsing is u.g.l.y it ain't got no alibi, it's ugly !
