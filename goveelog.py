@@ -6,6 +6,7 @@ import errno
 import fcntl
 import os
 import platform
+import signal
 import sys
 import time
 from pathlib import Path
@@ -603,6 +604,18 @@ async def main():
     if args.verbose:
         print(f"[MAIN DEBUG] Lock acquired successfully, continuing...")
         log_bluetooth_status()
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    def _request_stop():
+        if not stop_event.is_set():
+            print("\n[SCRIPT END] Stop signal received, shutting down...")
+            stop_event.set()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except NotImplementedError:
+            signal.signal(sig, lambda s, f: _request_stop())
     
     try:
         print("Starting BLE scan (Ctrl+C to stop)…")
@@ -659,8 +672,13 @@ async def main():
                             last_packet_timestamp = scan_started_at
                             reset_scan_counters()
                             
-                            while True:
-                                await asyncio.sleep(1)
+                            while not stop_event.is_set():
+                                try:
+                                    await asyncio.wait_for(stop_event.wait(), timeout=1)
+                                    print("[SCRIPT END] Stopping scan…")
+                                    break
+                                except asyncio.TimeoutError:
+                                    pass
                                 current_time = time.time()
                                 ads_received = getattr(detection_callback, "_all_count", 0)
 
@@ -734,6 +752,9 @@ async def main():
                                         print(f"[SCAN DEBUG] Found {len(govee_in_discovered)} Govee devices in discovered list")
                         except KeyboardInterrupt:
                             print("\nStopping scan…")
+                            stop_event.set()
+                    if stop_event.is_set():
+                        break
                     if restart_requested:
                         print("[WATCHDOG] Releasing discovery session...")
                         stop_bluetooth_discovery()
@@ -789,7 +810,9 @@ async def main():
             print("       3. Insufficient permissions to access Bluetooth")
             sys.exit(1)
     finally:
-        # Always release the lock
+        # Always stop discovery and release the lock so systemd SIGTERM
+        # cannot leave BlueZ stuck in Discovering: yes.
+        stop_bluetooth_discovery()
         lock.release()
 
 # ###########################################################################
